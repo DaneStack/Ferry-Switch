@@ -213,34 +213,107 @@ void drawProgressBar(SDL_Renderer* renderer, SDL_Rect rect, double fraction, SDL
     }
 }
 
-// A couple of faint wave lines echoing the boat/water motif from the app
-// icon, low enough in contrast that they read as texture rather than
-// content — drawn first, so everything else layers cleanly on top.
+// The app's water motif. This used to be three near-straight hairlines at
+// alpha 14, which read as empty rather than subtle — the wavelengths were
+// in radians rather than pixels, so each "wave" stretched well over two
+// screen widths and never actually curved.
+//
+// Now: a depth wash sinking toward the bottom of the screen, three filled
+// wave bands drifting at different speeds and directions, each capped
+// with a brighter crest line, and slow motes rising through them. Each
+// band mixes a second, shorter harmonic so the profile doesn't read as a
+// single mechanical sine.
+//
+// Everything is alpha-composited over Theme::background in the accent
+// color, which is the one constant across both themes — so the same
+// geometry works for dark and light with only an intensity difference,
+// rather than needing a second palette. Kept cheap deliberately (a few
+// dozen rects, three polygons, a handful of circles): this redraws every
+// frame behind everything else.
 void drawBackgroundWaves(SDL_Renderer* renderer) {
-    SDL_Color waveColor = Theme::accent;
-    Uint8 baseAlpha = 14;
-    double t = static_cast<double>(nowMs() % 20000) / 20000.0;
-    double drift = t * 40.0;
+    const bool dark = (Theme::mode() == Theme::Mode::Dark);
+    const double seconds = static_cast<double>(nowMs()) / 1000.0;
+    constexpr double tau = 6.28318530717958647692;
 
-    struct Wave { double baseY; double amplitude; double wavelength; Uint8 alpha; };
-    const Wave waves[] = {
-        { 560.0, 18.0, 260.0, baseAlpha },
-        { 620.0, 24.0, 340.0, static_cast<Uint8>(baseAlpha + 6) },
-        { 675.0, 14.0, 220.0, static_cast<Uint8>(baseAlpha + 4) },
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    // Depth wash — squared falloff so it stays clear of the content area
+    // up top and only gathers weight near the bottom edge.
+    constexpr int washTop = 260;
+    constexpr int bandHeight = 6;
+    const double washPeak = dark ? 30.0 : 24.0;
+    for (int y = washTop; y < screenHeight; y += bandHeight) {
+        double t = static_cast<double>(y - washTop) / static_cast<double>(screenHeight - washTop);
+        SDL_SetRenderDrawColor(renderer, Theme::accent.r, Theme::accent.g, Theme::accent.b,
+                               static_cast<Uint8>(t * t * washPeak));
+        SDL_Rect band { 0, y, screenWidth, bandHeight };
+        SDL_RenderFillRect(renderer, &band);
+    }
+
+    struct Layer {
+        double baseY;
+        double amplitude;
+        double wavelength; // in pixels, one full crest-to-crest
+        double speed;      // px/sec; negative drifts the other way
+        Uint8 fillAlpha;
+        Uint8 crestAlpha;
+    };
+    const Layer layers[] = {
+        { 512.0, 15.0, 560.0,  9.0,  static_cast<Uint8>(dark ? 12 : 10), static_cast<Uint8>(dark ? 46 : 40) },
+        { 580.0, 21.0, 380.0, -14.0, static_cast<Uint8>(dark ? 16 : 13), static_cast<Uint8>(dark ? 54 : 46) },
+        { 648.0, 13.0, 260.0,  21.0, static_cast<Uint8>(dark ? 20 : 16), static_cast<Uint8>(dark ? 62 : 52) },
     };
 
-    for (const auto& wave : waves) {
-        SDL_Color c = waveColor;
-        c.a = wave.alpha;
-        Uint32 packed = packColor(c);
-        int prevX = -40;
-        int prevY = static_cast<int>(wave.baseY + std::sin((prevX + drift) / wave.wavelength) * wave.amplitude);
-        for (int x = -40; x <= screenWidth + 40; x += 24) {
-            int py = static_cast<int>(wave.baseY + std::sin((x + drift) / wave.wavelength) * wave.amplitude);
-            aalineColor(renderer, prevX, prevY, x, py, packed);
-            prevX = x;
-            prevY = py;
+    constexpr int step = 20;
+    constexpr int columns = screenWidth / step + 1;
+    Sint16 vx[columns + 2];
+    Sint16 vy[columns + 2];
+
+    for (const auto& layer : layers) {
+        const double drift = seconds * layer.speed;
+        int n = 0;
+        for (int x = 0; x <= screenWidth; x += step) {
+            double primary = std::sin(tau * (x + drift) / layer.wavelength);
+            double harmonic = std::sin(tau * (x + drift * 1.7) / (layer.wavelength * 0.43));
+            double y = layer.baseY + (primary + 0.32 * harmonic) * layer.amplitude;
+            vx[n] = static_cast<Sint16>(x);
+            vy[n] = static_cast<Sint16>(y);
+            n++;
         }
+
+        // Crest first, so the fill's own edge doesn't soften it.
+        SDL_Color crest = Theme::accent;
+        crest.a = layer.crestAlpha;
+        Uint32 crestPacked = packColor(crest);
+        for (int i = 1; i < n; i++) {
+            aalineColor(renderer, vx[i - 1], vy[i - 1], vx[i], vy[i], crestPacked);
+        }
+
+        // Close the profile down to the bottom edge and fill the body.
+        vx[n] = static_cast<Sint16>(screenWidth);
+        vy[n] = static_cast<Sint16>(screenHeight);
+        n++;
+        vx[n] = 0;
+        vy[n] = static_cast<Sint16>(screenHeight);
+        n++;
+
+        SDL_Color body = Theme::accent;
+        body.a = layer.fillAlpha;
+        filledPolygonColor(renderer, vx, vy, n, packColor(body));
+    }
+
+    // Motes drifting up through the water. Positions are derived from the
+    // index rather than stored, so this stays stateless.
+    constexpr int moteCount = 16;
+    SDL_Color mote = Theme::accent;
+    mote.a = dark ? 26 : 20;
+    const Uint32 motePacked = packColor(mote);
+    for (int i = 0; i < moteCount; i++) {
+        int x = (i * 197 + 40) % screenWidth;
+        double speed = 9.0 + (i % 5) * 4.0;
+        double travel = std::fmod(seconds * speed + i * 73.0, screenHeight + 120.0);
+        int y = static_cast<int>(screenHeight + 60.0 - travel);
+        filledCircleColor(renderer, x, y, 2 + (i % 3), motePacked);
     }
 }
 

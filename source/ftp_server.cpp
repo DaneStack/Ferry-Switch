@@ -1709,7 +1709,9 @@ void FtpServer::doRmd(FtpClient& client, const std::string& name) {
         reply(client, "250 Directory removed\r\n");
         logEvent(LogEntry::Kind::Deleted, name);
     } else {
-        reply(client, "550 Could not remove directory\r\n");
+        std::string why = std::strerror(errno);
+        reply(client, "550 Could not remove directory: " + why + "\r\n");
+        logEvent(LogEntry::Kind::Error, "Remove folder failed: " + name + " (" + why + ")");
     }
 }
 
@@ -1720,7 +1722,13 @@ void FtpServer::doDele(FtpClient& client, const std::string& name) {
         reply(client, "250 File deleted\r\n");
         logEvent(LogEntry::Kind::Deleted, name);
     } else {
-        reply(client, "550 Could not delete file\r\n");
+        // The reason travels back to the client rather than being dropped:
+        // a bare "550 Could not delete file" is indistinguishable between
+        // a read-only mount, a missing file and a file still held open,
+        // and the client surfaces this text to the user verbatim.
+        std::string why = std::strerror(errno);
+        reply(client, "550 Could not delete file: " + why + "\r\n");
+        logEvent(LogEntry::Kind::Error, "Delete failed: " + name + " (" + why + ")");
     }
 }
 
