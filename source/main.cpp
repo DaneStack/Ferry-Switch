@@ -128,7 +128,23 @@ const ui::DeviceStatus& currentDeviceStatus() {
 
 int main(int argc, char** argv) {
     plInitialize(PlServiceType_User);
-    socketInitializeDefault();
+    // libnx's stock socket buffers are small — fine for control-channel
+    // traffic, but this app's whole job is moving bulk file data, and the
+    // FTP data connection only gets drained once per poll() tick (see
+    // stepTransfer()'s budgetMs). A too-small kernel-side TCP buffer fills
+    // up between drains and throttles the other side via TCP flow control
+    // regardless of how fast our own read/write loop is — this is a
+    // leading suspect for transfers (both directions, not just the ncm
+    // content-download path) topping out far below what DBI reportedly
+    // achieves on the same hardware. Same reasoning applies to send: a
+    // too-small tx buffer means our own send() calls return short/blocked
+    // sooner than they'd need to.
+    SocketInitConfig socketConfig = *socketGetDefaultInitConfig();
+    socketConfig.tcp_tx_buf_size = 1 * 1024 * 1024;
+    socketConfig.tcp_rx_buf_size = 1 * 1024 * 1024;
+    socketConfig.tcp_tx_buf_max_size = 4 * 1024 * 1024;
+    socketConfig.tcp_rx_buf_max_size = 4 * 1024 * 1024;
+    socketInitialize(&socketConfig);
 
     // This app's whole point is sitting idle waiting for a connection —
     // without this, the console auto-sleeps after a few minutes of no

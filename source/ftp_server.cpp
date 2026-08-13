@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -727,6 +728,17 @@ void FtpServer::handleCommand(FtpClient& client, const std::string& line) {
         reply(client, "215 UNIX Type: L8\r\n");
     } else if (cmd == "TYPE") {
         reply(client, "200 Type set\r\n");
+    } else if (cmd == "ALLO") {
+        // No real pre-allocation — just remembers the announced size so
+        // the *next* STOR's progress display has a total/percentage to
+        // show instead of only "bytes received so far". A malformed or
+        // missing argument just means nothing gets remembered, not an
+        // error — ALLO is inherently advisory. strtoll rather than
+        // std::stoll since this codebase builds with -fno-exceptions.
+        char* end = nullptr;
+        long long parsed = std::strtoll(arg.c_str(), &end, 10);
+        client.pendingAlloBytes = (end != arg.c_str() && parsed > 0) ? parsed : -1;
+        reply(client, "202 No storage allocation necessary\r\n");
     } else if (cmd == "PWD" || cmd == "XPWD") {
         reply(client, "257 \"" + reportedCwd(client) + "\"\r\n");
     } else if (cmd == "CWD" || cmd == "XCWD") {
@@ -1153,7 +1165,8 @@ void FtpServer::beginStorRecv(FtpClient& client, const std::string& name) {
     client.transfer.isUpload = true;
     client.transfer.name = name;
     client.transfer.directory = reportedCwd(client);
-    client.transfer.bytesTotal = -1;
+    client.transfer.bytesTotal = client.pendingAlloBytes; // -1 (unknown) if no ALLO preceded this STOR
+    client.pendingAlloBytes = -1;
     client.transfer.startMs = nowMs();
     client.recvChunk.resize(transferChunkSize);
     client.lastSpeedSampleMs = client.transfer.startMs;

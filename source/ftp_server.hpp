@@ -96,6 +96,15 @@ struct FtpClient {
     std::string renameFrom;
     bool disconnected = false; // set by closeClient(); FtpServer::poll() sweeps these out
 
+    // Set by ALLO (if the client sends one) and consumed by the next
+    // beginStorRecv() — an upload's size is otherwise unknown to this
+    // server until the transfer finishes, so the live progress display
+    // has nothing to show a percentage/total against. -1 = none pending.
+    // The Ferry Mac client sends this (it always knows a local file's
+    // size upfront); a generic FTP client that doesn't bother is still
+    // fine, just back to the old "bytes so far" display for that upload.
+    long long pendingAlloBytes = -1;
+
     // Purely cosmetic prefix — what PWD (and transfer-log entries) report
     // to the client — for the title name once inside a synthetic
     // InstalledGames/Saves folder. Kept separate from `cwd` itself rather
