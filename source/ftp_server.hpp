@@ -222,60 +222,104 @@ struct FtpClient {
     long long storWriteMs = 0;
 };
 
+// Everything the UI draws, copied out in one consistent piece. The server
+// runs on its own thread (see FtpServer), so the UI can't hold references
+// into live server state while it renders — it takes one of these per
+// frame instead, under a lock held only for the copy itself.
+struct ServerSnapshot {
+    std::string localIp;
+    size_t clientCount = 0;
+    std::string primaryClientIp;
+    std::vector<TransferInfo> transfers;
+    std::deque<LogEntry> log;
+    SessionStats stats;
+    bool pinProtected = false;
+    FtpRoot root = FtpRoot::Sd;
+};
+
 // A non-blocking, cooperatively-multiplexed FTP server tailored to what the
 // Ferry macOS client actually sends: USER/PASS/TYPE/PWD/CWD/CDUP/PASV/LIST/
 // RETR/STOR/MKD/RMD/DELE/RNFR/RNTO/SIZE/QUIT. Several clients can be
 // connected — and mid-transfer — at the same time, which is what makes the
 // Mac app's parallel-transfer mode actually run in parallel against a
 // Switch target. Every socket is non-blocking and each client's current
-// command or transfer is advanced by one bounded step per poll(), so
-// nothing here ever blocks the frame loop and no threads/mutexes are
-// needed — same single-thread guarantee the original single-client version
-// made, just multiplexed across a small pool of clients instead of one.
+// command or transfer is advanced by one bounded step per poll().
+//
+// **Threading.** poll() runs on a dedicated thread, not the frame loop.
+// It used to share the main thread, which capped throughput hard: the
+// frame loop is vsync-paced, so transfers only got ~60 chances a second
+// to move data and spent the rest of each frame parked in
+// SDL_RenderPresent — measured at ~77% of an upload's wall time going to
+// neither the socket nor the SD card, just waiting for the next tick.
+//
+// The concurrency rule that keeps this safe is deliberately narrow: the
+// server thread **exclusively owns** every member below except the ones
+// grouped under m_lock. It never takes the lock while doing socket or
+// file I/O — only to publish a snapshot, or to pick up requests from the
+// UI. The UI thread never touches server state directly: it reads
+// snapshot() and asks for changes through requestRoot()/setPin()/
+// requestDisconnectAll(), which the server thread applies between polls.
+// That's what makes root switching and NAND mounting safe without
+// locking the whole server, since those then only ever happen on the one
+// thread that reads them.
 class FtpServer {
 public:
     bool start(uint16_t port);
     void stop();
-    void poll();
 
     uint16_t port() const { return m_port; }
-    const std::string& localIp() const { return m_localIp; }
 
-    size_t clientCount() const { return m_clients.size(); }
-    // First connected client's address — only meaningful (and only used by
-    // the UI) when clientCount() == 1; with more than one, the UI shows a
-    // count instead of trying to list every address.
-    std::string primaryClientIp() const;
-    std::vector<TransferInfo> activeTransfers() const;
+    /// One consistent copy of everything the UI renders. Cheap — a few
+    /// small containers — and takes the lock only for the copy.
+    ServerSnapshot snapshot() const;
 
-    const std::deque<LogEntry>& log() const { return m_log; }
-    const SessionStats& stats() const { return m_stats; }
+    /// Asks the server thread to switch roots; applied before its next
+    /// poll(). Silently does nothing if a client is connected by then
+    /// (switching the filesystem out from under an active session would
+    /// leave its `cwd` pointing at nothing) or if mounting NAND fails —
+    /// the UI reflects whatever actually took effect via snapshot().root
+    /// on a later frame rather than assuming this succeeded.
+    void requestRoot(FtpRoot root);
 
-    // Fails (returns false, leaves the root unchanged) if any client is
-    // currently connected — switching the filesystem out from under an
-    // active browsing session would leave its `cwd` pointing at a path
-    // that no longer means anything — or if mounting NAND fails.
-    bool setRoot(FtpRoot root);
-    FtpRoot root() const { return m_root; }
-
-    // Forcibly drops every connected client — for the Switch-side "kick"
-    // control, when a connection needs resetting without touching the Mac
-    // client (a hung transfer, or just wanting to switch roots without
-    // waiting for the other side to disconnect on its own).
-    void disconnectAll();
+    /// Forcibly drops every connected client — for the Switch-side "kick"
+    /// control, when a connection needs resetting without touching the Mac
+    /// client (a hung transfer, or just wanting to switch roots without
+    /// waiting for the other side to disconnect on its own). Applied on
+    /// the server thread, before the root request above, so asking for
+    /// both at once works.
+    void requestDisconnectAll();
 
     // Empty = anonymous, no password required (the original behavior).
     // When set, USER replies 331 (password required) instead of 230, and
     // PASS must match exactly or the client is kicked with 530 — checked
     // against what the FTP client sends as its password, so on the Ferry
     // Mac side this is just the "password" field on the connection.
-    void setPin(const std::string& pin) { m_pin = pin; }
-    const std::string& pin() const { return m_pin; }
+    // Applied on the server thread like the requests above, so m_pin stays
+    // owned by that one thread and PASS can read it without locking.
+    void setPin(const std::string& pin);
 
 private:
+    static void threadEntry(void* self);
+    void threadMain();
+    /// Picks up whatever the UI asked for since the last poll — see the
+    /// threading note above. Takes the lock only to drain the requests.
+    void applyPendingRequests();
+    /// Copies current state into m_snapshot under the lock. Throttled:
+    /// the loop runs far faster than the screen refreshes, and there's no
+    /// point copying containers thousands of times a second.
+    void publishSnapshot();
+    /// One pass over every client. Returns true if any of them actually
+    /// moved data, which is what decides whether the thread sleeps before
+    /// coming back around (so an idle server doesn't spin a core).
+    bool poll();
+    bool setRoot(FtpRoot root);
+    void disconnectAll();
+    std::string primaryClientIp() const;
+    std::vector<TransferInfo> activeTransfers() const;
+
     void refreshLocalIp();
     void acceptNewClients();
-    void serviceClient(FtpClient& client);
+    bool serviceClient(FtpClient& client);
     void processBuffered(FtpClient& client);
     void handleCommand(FtpClient& client, const std::string& line);
     void reply(FtpClient& client, const std::string& text);
@@ -290,7 +334,7 @@ private:
     void beginListSend(FtpClient& client);
     void beginRetrSend(FtpClient& client, const std::string& name);
     void beginStorRecv(FtpClient& client, const std::string& name);
-    void stepTransfer(FtpClient& client);
+    bool stepTransfer(FtpClient& client);
     bool stepTransferOnce(FtpClient& client);
     void finishList(FtpClient& client, bool ok);
     void finishTransfer(FtpClient& client, bool ok);
@@ -352,4 +396,23 @@ private:
 
     std::vector<TitleInfo> m_titleCache;
     bool m_titleCacheLoaded = false;
+
+    // --- server thread ---
+    Thread m_thread{};
+    bool m_threadStarted = false;
+    // Written by stop() on the UI thread, read by the server thread. A
+    // plain bool rather than an atomic: it's a one-way latch that only
+    // ever goes false→true, and the thread is joined right after, so the
+    // worst case is noticing it one iteration late.
+    volatile bool m_stopRequested = false;
+    long long m_lastSnapshotMs = 0;
+
+    // --- everything below is guarded by m_lock ---
+    mutable Mutex m_lock{};
+    ServerSnapshot m_snapshot;
+    bool m_rootRequested = false;
+    FtpRoot m_requestedRoot = FtpRoot::Sd;
+    bool m_disconnectRequested = false;
+    bool m_pinRequested = false;
+    std::string m_requestedPin;
 };

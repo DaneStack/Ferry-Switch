@@ -101,7 +101,128 @@ bool FtpServer::start(uint16_t port) {
     setNonBlocking(m_listenFd);
 
     refreshLocalIp();
+    mutexInit(&m_lock);
+    publishSnapshot();
+
+    // Priority one step below the main thread's usual 0x2C (higher number
+    // = lower priority), so the frame loop always wins when both are
+    // runnable — a transfer saturating this thread must never cost frames.
+    // Default core, 128KB stack: the deepest thing running here is the
+    // ncm content scan's few-KB key array, everything large is heap.
+    if (R_FAILED(threadCreate(&m_thread, &FtpServer::threadEntry, this, nullptr, 0x20000, 0x2D, -2))) {
+        return false;
+    }
+    if (R_FAILED(threadStart(&m_thread))) {
+        threadClose(&m_thread);
+        return false;
+    }
+    m_threadStarted = true;
     return true;
+}
+
+void FtpServer::threadEntry(void* self) {
+    static_cast<FtpServer*>(self)->threadMain();
+}
+
+void FtpServer::threadMain() {
+    while (!m_stopRequested) {
+        applyPendingRequests();
+        bool didWork = poll();
+        publishSnapshot();
+
+        // Back-off in three steps, so an active transfer is never throttled
+        // but an idle console isn't waking a core for nothing either:
+        //   - moved data: yield only, come straight back for more
+        //   - connected but quiet: ~500 checks/sec, still far more
+        //     responsive than the 60 this got sharing the frame loop
+        //   - nobody connected: one check per frame's worth of time is
+        //     plenty to notice an accept()
+        u64 idleNs = 0;
+        if (!didWork) {
+            idleNs = m_clients.empty() ? 16'000'000ULL : 2'000'000ULL;
+        }
+        svcSleepThread(idleNs);
+    }
+}
+
+void FtpServer::applyPendingRequests() {
+    mutexLock(&m_lock);
+    bool wantDisconnect = m_disconnectRequested;
+    bool wantPin = m_pinRequested;
+    std::string newPin = m_requestedPin;
+    bool wantRoot = m_rootRequested;
+    FtpRoot newRoot = m_requestedRoot;
+    m_disconnectRequested = false;
+    m_pinRequested = false;
+    m_rootRequested = false;
+    mutexUnlock(&m_lock);
+
+    // Disconnect first: setRoot() refuses while anyone is still connected,
+    // so asking for both in one go (the natural "kick everyone off and
+    // switch" gesture) has to apply in this order to work.
+    if (wantDisconnect) {
+        disconnectAll();
+        m_clients.erase(
+            std::remove_if(m_clients.begin(), m_clients.end(), [](const FtpClient& c) { return c.disconnected; }),
+            m_clients.end());
+    }
+    if (wantPin) {
+        m_pin = newPin;
+    }
+    if (wantRoot) {
+        setRoot(newRoot);
+    }
+}
+
+void FtpServer::publishSnapshot() {
+    // ~30Hz is plenty for something only ever read by the renderer, and
+    // this loop can spin thousands of times a second.
+    long long now = nowMs();
+    if (now - m_lastSnapshotMs < 33) {
+        return;
+    }
+    m_lastSnapshotMs = now;
+
+    ServerSnapshot fresh;
+    fresh.localIp = m_localIp;
+    fresh.clientCount = m_clients.size();
+    fresh.primaryClientIp = primaryClientIp();
+    fresh.transfers = activeTransfers();
+    fresh.log = m_log;
+    fresh.stats = m_stats;
+    fresh.pinProtected = !m_pin.empty();
+    fresh.root = m_root;
+
+    mutexLock(&m_lock);
+    m_snapshot = std::move(fresh);
+    mutexUnlock(&m_lock);
+}
+
+ServerSnapshot FtpServer::snapshot() const {
+    mutexLock(&m_lock);
+    ServerSnapshot copy = m_snapshot;
+    mutexUnlock(&m_lock);
+    return copy;
+}
+
+void FtpServer::requestRoot(FtpRoot root) {
+    mutexLock(&m_lock);
+    m_rootRequested = true;
+    m_requestedRoot = root;
+    mutexUnlock(&m_lock);
+}
+
+void FtpServer::requestDisconnectAll() {
+    mutexLock(&m_lock);
+    m_disconnectRequested = true;
+    mutexUnlock(&m_lock);
+}
+
+void FtpServer::setPin(const std::string& pin) {
+    mutexLock(&m_lock);
+    m_pinRequested = true;
+    m_requestedPin = pin;
+    mutexUnlock(&m_lock);
 }
 
 void FtpServer::refreshLocalIp() {
@@ -118,6 +239,14 @@ void FtpServer::refreshLocalIp() {
 
 
 void FtpServer::stop() {
+    // Join before touching anything else — every member below is owned by
+    // the server thread while it's alive.
+    if (m_threadStarted) {
+        m_stopRequested = true;
+        threadWaitForExit(&m_thread);
+        threadClose(&m_thread);
+        m_threadStarted = false;
+    }
     for (auto& client : m_clients) {
         closeClient(client);
     }
@@ -603,20 +732,24 @@ void FtpServer::unmountClientVirtual(FtpClient& client) {
     }
 }
 
-void FtpServer::poll() {
+bool FtpServer::poll() {
     if (nowMs() - m_lastIpRefreshMs > 3000) {
         refreshLocalIp();
     }
 
     acceptNewClients();
 
+    bool didWork = false;
     for (auto& client : m_clients) {
-        serviceClient(client);
+        if (serviceClient(client)) {
+            didWork = true;
+        }
     }
 
     m_clients.erase(
         std::remove_if(m_clients.begin(), m_clients.end(), [](const FtpClient& c) { return c.disconnected; }),
         m_clients.end());
+    return didWork;
 }
 
 void FtpServer::acceptNewClients() {
@@ -642,7 +775,7 @@ void FtpServer::acceptNewClients() {
     }
 }
 
-void FtpServer::serviceClient(FtpClient& client) {
+bool FtpServer::serviceClient(FtpClient& client) {
     if (client.op == FtpClient::Op::AwaitData) {
         if (!acceptClientData(client)) {
             if (nowMs() > client.dataWaitDeadlineMs) {
@@ -650,7 +783,7 @@ void FtpServer::serviceClient(FtpClient& client) {
                 client.op = FtpClient::Op::Idle;
                 client.pendingKind = FtpClient::PendingKind::None;
             }
-            return;
+            return false;
         }
         switch (client.pendingKind) {
             case FtpClient::PendingKind::List:
@@ -667,13 +800,12 @@ void FtpServer::serviceClient(FtpClient& client) {
         }
         client.pendingKind = FtpClient::PendingKind::None;
         client.pendingName.clear();
-        return;
+        return true;
     }
 
     if (client.op == FtpClient::Op::ListSend || client.op == FtpClient::Op::RetrSend ||
         client.op == FtpClient::Op::StorRecv) {
-        stepTransfer(client);
-        return;
+        return stepTransfer(client);
     }
 
     char buf[512];
@@ -681,11 +813,13 @@ void FtpServer::serviceClient(FtpClient& client) {
     if (n > 0) {
         client.recvBuffer.append(buf, static_cast<size_t>(n));
         processBuffered(client);
+        return true;
     } else if (n == 0) {
         closeClient(client);
     } else if (!wouldBlock()) {
         closeClient(client);
     }
+    return false;
 }
 
 void FtpServer::processBuffered(FtpClient& client) {
@@ -1275,36 +1409,35 @@ void FtpServer::beginStorRecv(FtpClient& client, const std::string& name) {
     client.op = FtpClient::Op::StorRecv;
 }
 
-// Advances whichever operation `client.op` names for up to a few
-// milliseconds — repeatedly calling stepTransferOnce() until it hits
-// EWOULDBLOCK (nothing more available right now), finishes, or the budget
-// runs out. A single non-blocking send()/recv() only moves whatever
-// happens to already be sitting in the kernel socket buffer at that
-// instant; capping this to exactly one call per poll() tick (as an
-// earlier version of this did) means throughput per client is bounded by
-// the render frame rate (~60/s) rather than the actual network — that's
-// what made transfers crawl at a few hundred KB/s regardless of link
-// speed. Looping until genuinely blocked restores real throughput; the
-// time budget keeps one very active client from stalling the others or
-// the frame when several are transferring at once.
-void FtpServer::stepTransfer(FtpClient& client) {
-    // Raised from 8ms once removing the old mid-transfer present() and
-    // growing the socket buffers (see socketInitialize() in main.cpp)
-    // measurably helped throughput — more of each ~16.6ms frame (60Hz)
-    // spent moving bytes, since rendering itself no longer competes for
-    // that time the way the removed present() call used to. Still leaves
-    // headroom for the frame's own draw+present afterward.
-    constexpr long long budgetMs = 14;
+// Advances whichever operation `client.op` names, repeatedly calling
+// stepTransferOnce() until it hits EWOULDBLOCK (nothing more available
+// right now), finishes, or the budget runs out. A single non-blocking
+// send()/recv() only moves whatever happens to already be sitting in the
+// kernel socket buffer at that instant, so looping until genuinely
+// blocked is what gets real throughput rather than one chunk per pass.
+//
+// The budget is now only a fairness valve between clients — it used to
+// double as the frame's I/O time slice, back when this ran on the main
+// thread and every millisecond spent here was a millisecond the renderer
+// didn't get. On the server thread there's no frame to protect, so it's
+// sized generously: the loop almost always exits on EWOULDBLOCK long
+// before this, and the cap only matters when several clients are
+// saturating the link at once.
+bool FtpServer::stepTransfer(FtpClient& client) {
+    constexpr long long budgetMs = 100;
     long long deadline = nowMs() + budgetMs;
+    bool moved = false;
     while (nowMs() < deadline) {
         if (!stepTransferOnce(client)) {
-            break; // would block, or just finished/failed — nothing more to do this tick
+            break; // would block, or just finished/failed — nothing more to do now
         }
+        moved = true;
         if (client.op != FtpClient::Op::ListSend && client.op != FtpClient::Op::RetrSend &&
             client.op != FtpClient::Op::StorRecv) {
             break; // finished
         }
     }
+    return moved;
 }
 
 // transfer.speedBps as bytesDone/elapsedSinceStart (a cumulative average)

@@ -129,16 +129,12 @@ const ui::DeviceStatus& currentDeviceStatus() {
 int main(int argc, char** argv) {
     plInitialize(PlServiceType_User);
     // libnx's stock socket buffers are small — fine for control-channel
-    // traffic, but this app's whole job is moving bulk file data, and the
-    // FTP data connection only gets drained once per poll() tick (see
-    // stepTransfer()'s budgetMs). A too-small kernel-side TCP buffer fills
-    // up between drains and throttles the other side via TCP flow control
-    // regardless of how fast our own read/write loop is — this is a
-    // leading suspect for transfers (both directions, not just the ncm
-    // content-download path) topping out far below what DBI reportedly
-    // achieves on the same hardware. Same reasoning applies to send: a
-    // too-small tx buffer means our own send() calls return short/blocked
-    // sooner than they'd need to.
+    // traffic, but this app's whole job is moving bulk file data. A
+    // too-small kernel-side buffer fills up between drains and throttles
+    // the other side via TCP flow control no matter how fast the read/write
+    // loop itself is; on the send side, a small tx buffer makes send()
+    // return short or blocked sooner than it needs to. Raising these was
+    // worth roughly 4.5 -> 7MB/s when it landed.
     SocketInitConfig socketConfig = *socketGetDefaultInitConfig();
     socketConfig.tcp_tx_buf_size = 1 * 1024 * 1024;
     socketConfig.tcp_rx_buf_size = 1 * 1024 * 1024;
@@ -196,7 +192,12 @@ int main(int argc, char** argv) {
     // Which of the 4 root-picker cards has D-Pad/stick focus (separate from
     // which one is actually active) — kept in sync with the active root
     // whenever the Server tab is (re)entered, see below.
-    int serverCardFocus = ui::rootCardIndexOf(ftpServer.root());
+    // Seeded from the server's own view and re-synced from each frame's
+    // snapshot below, since root changes are applied asynchronously on the
+    // server thread now — the UI can't read back the result immediately.
+    ServerSnapshot snap = ftpServer.snapshot();
+    int serverCardFocus = ui::rootCardIndexOf(snap.root);
+    FtpRoot lastSeenRoot = snap.root;
 
     bool navHeld = false;
     int navDirection = 0;
@@ -219,13 +220,23 @@ int main(int argc, char** argv) {
 
     bool running = true;
     while (appletMainLoop() && running) {
-        ftpServer.poll();
+        // The FTP server runs on its own thread now (see FtpServer) — this
+        // loop only reads a snapshot of it to draw. Taken once per frame so
+        // every part of the frame agrees on what it's showing.
+        snap = ftpServer.snapshot();
+        // Whenever the server actually applies a root change, move the card
+        // focus to match. Only on an actual change, so it doesn't fight the
+        // user's own D-Pad movement in between.
+        if (snap.root != lastSeenRoot) {
+            lastSeenRoot = snap.root;
+            serverCardFocus = ui::rootCardIndexOf(snap.root);
+        }
 
         // The confirm-disconnect modal only makes sense while a client is
         // actually connected — if it dropped on its own while the modal was
         // up (rather than via the Y/A flow below), don't leave it stuck on
         // screen guarding a connection that's already gone.
-        if (mode == Mode::ConfirmDisconnect && ftpServer.clientCount() == 0) {
+        if (mode == Mode::ConfirmDisconnect && snap.clientCount == 0) {
             mode = Mode::Browsing;
         }
 
@@ -250,7 +261,7 @@ int main(int argc, char** argv) {
                 }
                 if (button == Btn::ZL) {
                     std::string newPin;
-                    const char* guide = ftpServer.pin().empty()
+                    const char* guide = !snap.pinProtected
                         ? "Set a PIN clients must send as their FTP password (leave empty for open access)"
                         : "Change the PIN, or leave empty to remove it";
                     if (readSwkbdText(guide, newPin)) {
@@ -274,21 +285,21 @@ int main(int argc, char** argv) {
                     screen = (screen == Screen::Browse) ? Screen::Server : Screen::Browse;
                     mode = Mode::Browsing;
                     if (screen == Screen::Server) {
-                        serverCardFocus = ui::rootCardIndexOf(ftpServer.root());
+                        serverCardFocus = ui::rootCardIndexOf(snap.root);
                     }
                     continue;
                 }
-                if (screen == Screen::Server && ftpServer.clientCount() == 0) {
+                if (screen == Screen::Server && snap.clientCount == 0) {
                     if (button == Btn::Y) {
                         FtpRoot next;
-                        switch (ftpServer.root()) {
+                        switch (snap.root) {
                             case FtpRoot::Sd: next = FtpRoot::Nand; break;
                             case FtpRoot::Nand: next = FtpRoot::InstalledGames; break;
                             case FtpRoot::InstalledGames: next = FtpRoot::Saves; break;
                             default: next = FtpRoot::Sd; break;
                         }
-                        ftpServer.setRoot(next);
-                        serverCardFocus = ui::rootCardIndexOf(ftpServer.root());
+                        ftpServer.requestRoot(next);
+                        serverCardFocus = ui::rootCardIndexOf(next);
                         continue;
                     }
                     if (button == Btn::DpadLeft || button == Btn::StickLeft) {
@@ -308,15 +319,14 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     if (button == Btn::A) {
-                        ftpServer.setRoot(ui::rootCardAtIndex(serverCardFocus));
-                        serverCardFocus = ui::rootCardIndexOf(ftpServer.root());
+                        ftpServer.requestRoot(ui::rootCardAtIndex(serverCardFocus));
                         continue;
                     }
                 }
-                if (screen == Screen::Server && ftpServer.clientCount() > 0) {
+                if (screen == Screen::Server && snap.clientCount > 0) {
                     if (mode == Mode::ConfirmDisconnect) {
                         if (button == Btn::A) {
-                            ftpServer.disconnectAll();
+                            ftpServer.requestDisconnectAll();
                             mode = Mode::Browsing;
                         } else if (button == Btn::B) {
                             mode = Mode::Browsing;
@@ -384,10 +394,10 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (!showHelp && screen == Screen::Server && ftpServer.clientCount() == 0) {
+                if (!showHelp && screen == Screen::Server && snap.clientCount == 0) {
                     if (auto tapped = ui::rootCardAt(touchX, touchY)) {
-                        ftpServer.setRoot(*tapped);
-                        serverCardFocus = ui::rootCardIndexOf(ftpServer.root());
+                        ftpServer.requestRoot(*tapped);
+                        serverCardFocus = ui::rootCardIndexOf(*tapped);
                     }
                 }
 
@@ -496,14 +506,14 @@ int main(int argc, char** argv) {
                 ui::drawModal(renderer, fontRegular, fontBold, "Delete", body, "A Confirm   B Cancel");
             }
         } else {
-            ui::drawServerFrame(renderer, fontRegular, fontBold, ftpServer.localIp(), ftpServer.port(),
-                                 ftpServer.clientCount(), ftpServer.primaryClientIp(), ftpServer.activeTransfers(),
-                                 ftpServer.log(), ftpServer.stats(), !ftpServer.pin().empty(), currentDeviceStatus(),
-                                 ftpServer.root(), serverCardFocus);
+            ui::drawServerFrame(renderer, fontRegular, fontBold, snap.localIp, ftpServer.port(),
+                                 snap.clientCount, snap.primaryClientIp, snap.transfers,
+                                 snap.log, snap.stats, snap.pinProtected, currentDeviceStatus(),
+                                 snap.root, serverCardFocus);
             if (mode == Mode::ConfirmDisconnect) {
-                std::string body = ftpServer.clientCount() == 1
-                    ? ("Disconnect " + ftpServer.primaryClientIp() + "?")
-                    : ("Disconnect all " + std::to_string(ftpServer.clientCount()) + " clients?");
+                std::string body = snap.clientCount == 1
+                    ? ("Disconnect " + snap.primaryClientIp + "?")
+                    : ("Disconnect all " + std::to_string(snap.clientCount) + " clients?");
                 ui::drawModal(renderer, fontRegular, fontBold, "Disconnect", body, "A Confirm   B Cancel");
             }
         }
