@@ -199,6 +199,11 @@ struct FtpClient {
     long long dataWaitDeadlineMs = 0;
 
     FILE* file = nullptr;
+    // Backing store for the upload FILE*'s stdio buffer (installed via
+    // setvbuf in beginStorRecv). Owned here rather than left to stdio
+    // because setvbuf does not copy it — it has to stay alive for as long
+    // as the stream does. See uploadWriteBufferSize.
+    std::vector<char> fileBuffer;
     std::string sendBuffer;   // ListSend (whole listing) / RetrSend (one chunk at a time)
     size_t sendOffset = 0;
     std::vector<char> recvChunk; // StorRecv's reusable recv() target, sized once per transfer
@@ -207,6 +212,14 @@ struct FtpClient {
     // Rolling window for transfer.speedBps — see stepTransferOnce().
     long long lastSpeedSampleMs = 0;
     long long lastSpeedSampleBytes = 0;
+
+    // Upload-side equivalents of retrContentReadMs/retrContentSendMs:
+    // how much of an upload's wall time went to pulling bytes off the
+    // socket vs. writing them to the SD card. Logged at finishTransfer()
+    // so a hardware run says which half is actually the bottleneck
+    // instead of it being guessed at.
+    long long storRecvMs = 0;
+    long long storWriteMs = 0;
 };
 
 // A non-blocking, cooperatively-multiplexed FTP server tailored to what the

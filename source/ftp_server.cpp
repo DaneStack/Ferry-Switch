@@ -39,6 +39,17 @@ constexpr size_t transferChunkSize = 256 * 1024;
 // if this doesn't move the needle, the bottleneck is elsewhere.
 constexpr size_t contentReadChunkSize = 4 * 1024 * 1024;
 
+// stdio's default buffer is on the order of a kilobyte, so every 256KB
+// fwrite() of received data was being chopped into hundreds of small
+// underlying writes — each one a round trip to the filesystem service —
+// while the download path writes straight to the socket with no stdio in
+// the way at all. That asymmetry lines up exactly with uploads measuring
+// ~3MB/s against ~9-10MB/s for downloads over the same connection. A
+// buffer comfortably larger than transferChunkSize lets whole chunks go
+// out in one write instead. Installed via setvbuf() in beginStorRecv(),
+// backed by FtpClient::fileBuffer (setvbuf does not take ownership).
+constexpr size_t uploadWriteBufferSize = 1 * 1024 * 1024;
+
 // How many clients can be connected (browsing or transferring) at once.
 // Sized a little above the Mac app's default of 3 parallel transfer
 // workers so a browse-only connection doesn't starve them for a slot.
@@ -1169,6 +1180,10 @@ void FtpServer::beginStorRecv(FtpClient& client, const std::string& name) {
         return;
     }
 
+    // Must happen before any I/O on the stream — see uploadWriteBufferSize.
+    client.fileBuffer.resize(uploadWriteBufferSize);
+    setvbuf(f, client.fileBuffer.data(), _IOFBF, client.fileBuffer.size());
+
     client.file = f;
     client.transfer = TransferInfo{};
     client.transfer.isUpload = true;
@@ -1180,6 +1195,8 @@ void FtpServer::beginStorRecv(FtpClient& client, const std::string& name) {
     client.recvChunk.resize(transferChunkSize);
     client.lastSpeedSampleMs = client.transfer.startMs;
     client.lastSpeedSampleBytes = 0;
+    client.storRecvMs = 0;
+    client.storWriteMs = 0;
     client.op = FtpClient::Op::StorRecv;
 }
 
@@ -1343,10 +1360,14 @@ bool FtpServer::stepTransferOnce(FtpClient& client) {
             return false;
         }
         case FtpClient::Op::StorRecv: {
+            long long recvStartMs = nowMs();
             ssize_t n = recv(client.dataFd, client.recvChunk.data(), client.recvChunk.size(), 0);
+            client.storRecvMs += nowMs() - recvStartMs;
             if (n > 0) {
-                if (std::fwrite(client.recvChunk.data(), 1, static_cast<size_t>(n), client.file) !=
-                    static_cast<size_t>(n)) {
+                long long writeStartMs = nowMs();
+                size_t written = std::fwrite(client.recvChunk.data(), 1, static_cast<size_t>(n), client.file);
+                client.storWriteMs += nowMs() - writeStartMs;
+                if (written != static_cast<size_t>(n)) {
                     finishTransfer(client, false);
                     return false;
                 }
@@ -1379,9 +1400,21 @@ void FtpServer::finishList(FtpClient& client, bool ok) {
 
 void FtpServer::finishTransfer(FtpClient& client, bool ok) {
     if (client.file) {
+        // Timed as write cost for uploads: with a 1MB stdio buffer this
+        // flush can be a meaningful chunk of the total, and attributing it
+        // anywhere else would make the numbers below misleading.
+        long long closeStartMs = nowMs();
         fclose(client.file);
         client.file = nullptr;
+        if (client.transfer.isUpload) {
+            client.storWriteMs += nowMs() - closeStartMs;
+        }
     }
+    // Safe only now that the stream is closed — setvbuf's buffer has to
+    // outlive it. Released rather than kept so an idle client isn't
+    // sitting on a megabyte between transfers.
+    client.fileBuffer.clear();
+    client.fileBuffer.shrink_to_fit();
     // Captured before the reset below, so a completed content transfer can
     // log how much of its wall-clock time was actually spent inside
     // ncmContentStorageReadContentIdFile() vs. everything else (mostly
@@ -1410,6 +1443,16 @@ void FtpServer::finishTransfer(FtpClient& client, bool ok) {
             logEvent(LogEntry::Kind::Uploaded, client.transfer.name, client.transfer.bytesDone);
             m_stats.bytesUp += client.transfer.bytesDone;
             m_stats.filesUp += 1;
+            // Same purpose (and same Kind::Error-for-styling reasoning) as
+            // the DL line below: says whether an upload's time went to the
+            // socket or to the SD card write.
+            long long totalMs = std::max<long long>(1, nowMs() - client.transfer.startMs);
+            int recvPct = static_cast<int>(client.storRecvMs * 100 / totalMs);
+            int writePct = static_cast<int>(client.storWriteMs * 100 / totalMs);
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "UL timing: %lldms total, recv=%lldms(%d%%) write=%lldms(%d%%)",
+                          totalMs, client.storRecvMs, recvPct, client.storWriteMs, writePct);
+            logEvent(LogEntry::Kind::Error, buf);
         } else {
             logEvent(LogEntry::Kind::Downloaded, client.transfer.name, client.transfer.bytesDone);
             m_stats.bytesDown += client.transfer.bytesDone;
