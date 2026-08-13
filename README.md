@@ -105,7 +105,9 @@ Login is anonymous by default. Press **ZL** to set a PIN; clients then have to s
 
 A minimal FTP server tailored to what the Ferry macOS client actually sends: `USER`, `PASS`, `SYST`, `TYPE`, `ALLO`, `PWD`/`XPWD`, `CWD`/`XCWD`, `CDUP`/`XCUP`, `PASV`, `LIST`/`NLST`, `RETR`, `STOR`, `MKD`/`XMKD`, `RMD`/`XRMD`, `DELE`, `RNFR`, `RNTO`, `SIZE`, `NOOP`, `QUIT`. Passive mode only — clients that insist on active mode (`PORT`) won't work.
 
-Up to 4 clients can be connected, and mid-transfer, at once. Every socket is non-blocking and each client's current command or transfer is advanced by one bounded step per frame, so nothing blocks the UI and no threads are involved — which is what makes the Mac app's parallel-transfer mode actually run in parallel against a Switch target.
+Up to 4 clients can be connected, and mid-transfer, at once — which is what makes the Mac app's parallel-transfer mode actually run in parallel against a Switch target. Every socket is non-blocking and each client's current command or transfer advances a bounded step at a time, so one busy client can't stall the others.
+
+The server runs on its own thread, at a priority just below the UI's, so transfers aren't paced by the display refresh and a saturated link can't cost frames. It used to share the frame loop, which capped throughput hard: roughly three quarters of a transfer's wall time went to waiting for the next frame rather than to the network or the SD card.
 
 `ALLO` is advisory here: it doesn't pre-allocate anything, it just lets an upload's on-screen progress show a total and a percentage instead of only bytes-so-far. Clients that don't send it still upload fine.
 
@@ -147,6 +149,8 @@ This produces `Ferry.nro`, with the file-type icons under `romfs/` bundled into 
 ## Installing
 
 Copy `Ferry.nro` to `/switch/Ferry/Ferry.nro` on your SD card, then launch it from the Homebrew Menu (hbmenu).
+
+To update it later, upload the new build straight over the existing `Ferry.nro` rather than deleting that file first — an upload replaces the file in place, and the copy you're currently running is the one you'd be trying to delete.
 
 ## The macOS client
 
