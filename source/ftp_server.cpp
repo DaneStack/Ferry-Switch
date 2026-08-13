@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <map>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <optional>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -977,6 +978,14 @@ bool FtpServer::acceptClientData(FtpClient& client) {
         return false;
     }
     setNonBlocking(fd);
+    // This connection only ever carries one big sequential transfer, never
+    // small interactive writes — Nagle's algorithm (batching small writes
+    // to wait for an ACK) has nothing to buy here and can only add latency
+    // between chunks, so it's turned off. Standard for a bulk-transfer
+    // socket; failure is silently ignored — if the platform doesn't
+    // support it, transfers still work, just without this one optimization.
+    int yes = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     close(client.pasvFd);
     client.pasvFd = -1;
     client.dataFd = fd;
@@ -1187,7 +1196,13 @@ void FtpServer::beginStorRecv(FtpClient& client, const std::string& name) {
 // time budget keeps one very active client from stalling the others or
 // the frame when several are transferring at once.
 void FtpServer::stepTransfer(FtpClient& client) {
-    constexpr long long budgetMs = 8;
+    // Raised from 8ms once removing the old mid-transfer present() and
+    // growing the socket buffers (see socketInitialize() in main.cpp)
+    // measurably helped throughput — more of each ~16.6ms frame (60Hz)
+    // spent moving bytes, since rendering itself no longer competes for
+    // that time the way the removed present() call used to. Still leaves
+    // headroom for the frame's own draw+present afterward.
+    constexpr long long budgetMs = 14;
     long long deadline = nowMs() + budgetMs;
     while (nowMs() < deadline) {
         if (!stepTransferOnce(client)) {
