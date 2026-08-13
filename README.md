@@ -2,6 +2,8 @@
 
 *[Русская версия](README.ru.md)*
 
+![Ferry — FTP server for Nintendo Switch](docs/banner.png)
+
 A native Nintendo Switch homebrew app that turns the console into an FTP server, so files can be moved to and from it over Wi-Fi from any FTP client on the same network. It's a drop-in replacement for DBI's built-in ftpd: same job, plus a live status screen (who's connected, what's being sent or received and how fast), a picker for *which* filesystem to expose, and a local SD card file browser.
 
 Styled to match the [macOS Ferry client](https://github.com/DanilKhmyrov/Ferry) (a dual-pane FTP **and SFTP** client) — same dark palette, same teal accent, same ferry icon — but it's an ordinary FTP server underneath, so any FTP client works.
