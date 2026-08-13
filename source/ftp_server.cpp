@@ -844,6 +844,81 @@ void FtpServer::changeDirectory(FtpClient& client, const std::string& arg) {
     // InstalledGames' per-title content listing is flat, so nothing else
     // is navigable there.
     if (m_root == FtpRoot::InstalledGames || m_root == FtpRoot::Saves) {
+        // An absolute path has to be resolved from the virtual top rather
+        // than falling through to the real-path logic below, which knows
+        // nothing about titles. This is not a rare case: every transfer
+        // the Mac client runs opens its own connection and navigates it
+        // with a single absolute CWD to the directory it captured from
+        // PWD (e.g. "/Terraria [0100E46006708000]/"), so without this,
+        // downloading anything at all from InstalledGames or Saves fails
+        // with 550 before it starts — only the browsing connection, which
+        // got there by relative steps, could see those folders.
+        if (!arg.empty() && arg[0] == '/' && arg != "/") {
+            std::vector<std::string> segments;
+            size_t start = 0;
+            while (start < arg.size()) {
+                size_t slash = arg.find('/', start);
+                if (slash == std::string::npos) {
+                    slash = arg.size();
+                }
+                if (slash > start) {
+                    segments.push_back(arg.substr(start, slash - start));
+                }
+                start = slash + 1;
+            }
+
+            // Unwind whatever this client is currently inside, so the path
+            // is resolved from the top exactly as written.
+            if (client.virtualMounted || client.virtualTitleId != 0) {
+                leaveTitle(client);
+            }
+            client.installsEntered = false;
+            client.virtualCwdDisplay.clear();
+            client.cwd = "/";
+
+            if (segments.empty()) {
+                reply(client, "250 Directory changed\r\n");
+                return;
+            }
+
+            bool entered = false;
+            if (m_root == FtpRoot::InstalledGames && segments[0] == "Installs") {
+                client.installsEntered = true;
+                client.virtualCwdDisplay = "/Installs/";
+                entered = true;
+            } else {
+                entered = enterTitle(client, segments[0]);
+            }
+            if (!entered) {
+                reply(client, "550 Directory not found\r\n");
+                return;
+            }
+
+            // Anything past the first segment is a real path inside a
+            // mounted save or the Installs folder; InstalledGames' own
+            // per-title listing is flat, so a deeper path there is bogus.
+            if (segments.size() > 1) {
+                if (m_root == FtpRoot::InstalledGames && !client.installsEntered) {
+                    reply(client, "550 Directory not found\r\n");
+                    return;
+                }
+                std::string deeper = "/";
+                for (size_t i = 1; i < segments.size(); i++) {
+                    deeper += segments[i] + "/";
+                }
+                // Set it first so localPath() resolves against the right
+                // mount prefix, and put it back if the path isn't real.
+                client.cwd = deeper;
+                struct stat st{};
+                if (stat(localPath(client, "").c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                    client.cwd = "/";
+                    reply(client, "550 Directory not found\r\n");
+                    return;
+                }
+            }
+            reply(client, "250 Directory changed\r\n");
+            return;
+        }
         if (atVirtualTop(client)) {
             if (arg == ".." || arg == "/") {
                 reply(client, "250 Directory changed\r\n");
