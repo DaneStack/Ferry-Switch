@@ -376,6 +376,7 @@ private:
     std::string buildTitleContentListing(FtpClient& client) const;
     bool enterTitle(FtpClient& client, const std::string& folderName);
     void leaveTitle(FtpClient& client);
+    const std::vector<VirtualContentEntry>* lookupVirtualContent(FtpClient& client, const std::string& filename);
     bool beginContentRetr(FtpClient& client, const std::string& filename);
 
     int m_listenFd = -1;

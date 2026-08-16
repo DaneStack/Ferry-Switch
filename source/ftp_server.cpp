@@ -640,8 +640,14 @@ std::string FtpServer::buildTitleContentListing(FtpClient& client) const {
 // content listing (InstalledGames). Returns false (leaving `client`
 // unchanged) if the name doesn't match a known title or the mount fails.
 bool FtpServer::enterTitle(FtpClient& client, const std::string& folderName) {
+    // Through titles() rather than m_titleCache directly: the cache is
+    // filled on first use, and a client can reach a CWD before anything has
+    // listed the top level — curl walks straight to the folder it was given
+    // in the URL. Reading the member here meant that first CWD searched an
+    // empty cache and answered "550 Directory not found" for a title that
+    // is installed.
     const TitleInfo* match = nullptr;
-    for (const auto& title : m_titleCache) {
+    for (const auto& title : titles()) {
         if (title.displayName == folderName) {
             match = &title;
             break;
@@ -1320,14 +1326,40 @@ void FtpServer::beginRetrSend(FtpClient& client, const std::string& name) {
 // content-storage handle itself is opened lazily there, not here, since a
 // merged file's items can span two different storages. Returns false
 // (nothing opened) if the name doesn't match or any ncm call fails.
-bool FtpServer::beginContentRetr(FtpClient& client, const std::string& filename) {
-    const std::vector<VirtualContentEntry>* metas = nullptr;
-    for (const auto& entry : client.virtualContentFiles) {
-        if (entry.first == filename) {
-            metas = &entry.second;
-            break;
+// Finds a generated .nsp by the name a client asked for, building the
+// lookup table first if this client hasn't listed the directory yet.
+//
+// The table is normally filled in as a side effect of listing, which is
+// enough for an interactive client — Finder, FileZilla and Ferry's own Mac
+// app all list before they touch a file. Anything that goes straight to the
+// file does not: curl's CWD-then-SIZE-then-RETR walk, a script, a client
+// working from a cached listing. Those used to be told a file that is right
+// there doesn't exist. Costs one ncm scan, and only on the miss.
+const std::vector<VirtualContentEntry>* FtpServer::lookupVirtualContent(FtpClient& client,
+                                                                        const std::string& filename) {
+    auto find = [&client, &filename]() -> const std::vector<VirtualContentEntry>* {
+        for (const auto& entry : client.virtualContentFiles) {
+            if (entry.first == filename) {
+                return &entry.second;
+            }
         }
+        return nullptr;
+    };
+
+    if (const std::vector<VirtualContentEntry>* hit = find()) {
+        return hit;
     }
+    if (atVirtualTop(client)) {
+        titles(); // as in beginListSend: m_titleCache must be loaded first
+        buildTitleListing(client);
+    } else if (m_root == FtpRoot::InstalledGames && client.virtualTitleId != 0) {
+        buildTitleContentListing(client);
+    }
+    return find();
+}
+
+bool FtpServer::beginContentRetr(FtpClient& client, const std::string& filename) {
+    const std::vector<VirtualContentEntry>* metas = lookupVirtualContent(client, filename);
     if (!metas) {
         return false;
     }
@@ -1754,6 +1786,23 @@ void FtpServer::doRnto(FtpClient& client, const std::string& name) {
 }
 
 void FtpServer::doSize(FtpClient& client, const std::string& name) {
+    // The generated .nsp files have no path to stat — their size is the
+    // PFS0 header plus every content record, the same figure the listing
+    // reports. curl asks SIZE before it will start a download at all, so
+    // without this it refuses to fetch them.
+    if (m_root == FtpRoot::InstalledGames && (client.virtualTitleId != 0 || atVirtualTop(client))) {
+        if (const std::vector<VirtualContentEntry>* metas = lookupVirtualContent(client, name)) {
+            std::vector<NspContentItem> items = gatherItems(*metas);
+            if (!items.empty()) {
+                char buf[48];
+                std::snprintf(buf, sizeof(buf), "213 %lld\r\n",
+                              static_cast<long long>(pfs0TotalSize(items)));
+                reply(client, buf);
+                return;
+            }
+        }
+    }
+
     std::string path = localPath(client, name);
     struct stat st{};
     if (stat(path.c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) {

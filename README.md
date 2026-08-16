@@ -123,8 +123,7 @@ The server runs on its own thread, at a priority just below the UI's, so transfe
 ## Known limitations
 
 - The root filesystem can't be switched while a client is connected — switching it out from under an active session would leave that session's working directory pointing at nothing. Disconnect first (**Y** on the Server screen) or wait for the client to disconnect.
-- `SIZE` isn't answered for the generated `.nsp` files under **Installed Games**; their sizes come from the directory listing instead. Clients that require a `SIZE` response before downloading may complain.
-- The generated `.nsp` files are assembled to the documented PFS0 layout, but have not yet been round-tripped through an installer on real hardware. Treat them as unverified for now.
+- The generated `.nsp` files have been verified structurally, not through an installer. A file pulled off real hardware parses as a valid PFS0 — magic, entry table and string table intact, entries contiguous, the last one ending exactly at the end of the file — and every NCA inside it hashes to its own content ID, which is the same integrity check an installer performs. What hasn't been done is feeding one back to DBI and installing it. A title with an update, the merged `[B+U]` file and multi-gigabyte sizes are also still untested.
 - Active-mode FTP is not implemented.
 
 ## Building
