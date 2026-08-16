@@ -5,14 +5,21 @@
 
 namespace {
 
-// Directory-entry names can't contain '/', and control characters are
-// asking for trouble in an FTP listing — anything installed with a weird
-// title (some homebrew forwarders do this) gets flattened to '_' rather
-// than corrupting the listing.
+// These names are not only listing text — they become the filename of the
+// generated .nsp, and the whole point of that file is to be downloaded and
+// then put back on the SD card for an installer to pick up. The card is
+// FAT/exFAT, so a name it rejects means a dump that cannot make the return
+// trip: a title like "Animal Crossing: New Horizons" downloaded fine and
+// then failed to upload with "550 Could not create file", because of the
+// colon alone. So the whole set FAT refuses is flattened here, not just the
+// separators that would corrupt a listing. Control characters go too —
+// some homebrew forwarders install themselves under genuinely strange
+// titles.
 std::string sanitize(const std::string& raw) {
     std::string out = raw;
     for (char& c : out) {
-        if (c == '/' || c == '\\' || static_cast<unsigned char>(c) < 0x20) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+            c == '>' || c == '|' || static_cast<unsigned char>(c) < 0x20) {
             c = '_';
         }
     }

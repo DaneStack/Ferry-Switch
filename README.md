@@ -43,6 +43,8 @@ A synthetic listing built from the console's own content-meta database. The top 
 
 Those files don't exist anywhere on disk. Ferry builds the PFS0 container header up front from the sizes and content IDs the console reports, then streams the content records straight out of `ncm` as the client downloads them — the same data DBI presents at the same level, assembled on the fly.
 
+**These dumps carry the game's content but not its ticket, so a title bought from the eShop will not install from one.** DBI reads the container, transfers every NCA and reports each one's signature as valid — and then stops at `Required tickets not found`, because the key that content is encrypted with lives in the console's own ES storage and Ferry doesn't reach into it. Titles that carry no title key at all, such as homebrew, are unaffected. If you want dumps you can install, use [nxdumptool](https://github.com/DarkMatterCore/nxdumptool), which is built for exactly that.
+
 The top level also has an **`Installs`** folder. Unlike everything else under this root, it's a real, writable folder on the SD card (`/switch/Ferry/Installs`): upload a `.nsp`, `.nsz`, `.xci` or `.xcz` there — or drop one at the root of this filesystem, which lands in the same place — and it is written to the SD card as a plain file, nothing more.
 
 **Ferry does not install anything.** It does not parse, verify, decrypt or unpack what you upload, and it never writes to the console's system storage. Uploading here only stages a file on the SD card; installing it afterwards is a separate step you perform yourself with DBI or another installer. Ferry is a file-transfer tool, and that is the whole of what this folder does.
@@ -123,7 +125,7 @@ The server runs on its own thread, at a priority just below the UI's, so transfe
 ## Known limitations
 
 - The root filesystem can't be switched while a client is connected — switching it out from under an active session would leave that session's working directory pointing at nothing. Disconnect first (**Y** on the Server screen) or wait for the client to disconnect.
-- The generated `.nsp` files have been verified structurally, not through an installer. A file pulled off real hardware parses as a valid PFS0 — magic, entry table and string table intact, entries contiguous, the last one ending exactly at the end of the file — and every NCA inside it hashes to its own content ID, which is the same integrity check an installer performs. What hasn't been done is feeding one back to DBI and installing it. A title with an update, the merged `[B+U]` file and multi-gigabyte sizes are also still untested.
+- The generated `.nsp` files are sound but incomplete: they carry no ticket, so an eShop title won't install from one. Verified on hardware — a dump taken off the console parses as a valid PFS0 with contiguous entries ending exactly at the end of the file, every NCA hashes to its own content ID, and DBI independently reports every NCA's signature as valid before refusing the install with `Required tickets not found`. See **Installed Games** above. A title with an update, the merged `[B+U]` file and multi-gigabyte sizes are still untested.
 - Active-mode FTP is not implemented.
 
 ## Building

@@ -53,7 +53,12 @@ constexpr size_t uploadWriteBufferSize = 1 * 1024 * 1024;
 // How many clients can be connected (browsing or transferring) at once.
 // Sized a little above the Mac app's default of 3 parallel transfer
 // workers so a browse-only connection doesn't starve them for a slot.
-constexpr size_t kMaxClients = 4;
+// Ferry's own macOS client needs four of these on its own: one control
+// connection for browsing plus one per concurrent transfer, and it runs
+// three at a time. At four this left no headroom whatsoever — a second
+// client, or a worker from the previous transfer that hadn't been reaped
+// yet, and the next connection had nowhere to go. Eight fits two of them.
+constexpr size_t kMaxClients = 8;
 
 // How long a PASV listener waits for the client to actually open the data
 // connection before giving up — matches the original blocking version's
@@ -759,7 +764,7 @@ bool FtpServer::poll() {
 }
 
 void FtpServer::acceptNewClients() {
-    while (m_clients.size() < kMaxClients) {
+    for (;;) {
         sockaddr_in addr{};
         socklen_t len = sizeof(addr);
         int fd = accept(m_listenFd, reinterpret_cast<sockaddr*>(&addr), &len);
@@ -769,6 +774,22 @@ void FtpServer::acceptNewClients() {
         setNonBlocking(fd);
 
         std::string ip = inet_ntoa(addr.sin_addr);
+
+        // Being full used to mean simply not calling accept() — but the
+        // kernel completes the handshake into the listen backlog anyway, so
+        // the client believed it had connected and sat waiting for a 220
+        // that was never coming. A silent hang, with no error to show and
+        // nothing in the log. Say so and hang up instead, and keep draining
+        // so nobody else is left waiting in the backlog either.
+        if (m_clients.size() >= kMaxClients) {
+            static const char kFull[] = "421 Too many connections\r\n";
+            send(fd, kFull, sizeof(kFull) - 1, 0);
+            close(fd);
+            logEvent(LogEntry::Kind::Error, "Refused " + ip + ": all " +
+                                                std::to_string(kMaxClients) + " slots in use");
+            continue;
+        }
+
         FtpClient client;
         client.controlFd = fd;
         client.ip = ip;
